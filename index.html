@@ -786,9 +786,49 @@ function renderKelas(){
 function processRealSheetData(rows, kelasRows) {
   MASTER_KELAS = []; SUBMITTED_KEYS = new Set();
   if(kelasRows && kelasRows.length > 1){
+    // Cari kolom berdasarkan NAMA header, bukan posisi tetap, supaya tetap benar
+    // walau urutan kolom di sheet "Master Kelas" bergeser.
+    const nk = (x) => (x || "").toString().trim().toLowerCase().replace(/[\s._\-\/]+/g, "");
+    const hk = (kelasRows[0] || []).map(nk);
+
+    // Cocok persis dulu, baru sebagian. `hindari` mencegah tabrakan substring —
+    // tanpa ini kata "wa" ikut cocok dengan "wali" sehingga kolom No WA salah ambil.
+    const cariKolom = (kandidat, fallback, hindari = []) => {
+      const boleh = (h) => !hindari.some(x => h.includes(x));
+      for (const k of kandidat) {
+        const i = hk.findIndex(h => h === nk(k) && boleh(h));
+        if (i !== -1) return i;
+      }
+      for (const k of kandidat) {
+        const i = hk.findIndex(h => h.includes(nk(k)) && boleh(h));
+        if (i !== -1) return i;
+      }
+      return fallback;
+    };
+
+    const kNama = cariKolom(["namakelas", "kelas", "rombel"], 0);
+    const kWali = cariKolom(["waliketuakelas", "walikelas", "wali", "ketuakelas", "ketua"], 1);
+    const kWA   = cariKolom(
+      ["nowa", "nomorwa", "whatsapp", "nohp", "nomorhp", "notelp", "telepon", "kontak", "hp", "wa"],
+      2,
+      ["wali", "ketua"]   // jangan pernah pilih kolom wali sebagai kolom nomor
+    );
+
     for(let i=1;i<kelasRows.length;i++){
-      const r = kelasRows[i]; if(!r || !r[0]) continue;
-      MASTER_KELAS.push({ nama: r[0].toString().trim(), wali: r[1] || "-", noWA: r[2] || "" });
+      const r = kelasRows[i]; if(!r) continue;
+      const nama = (r[kNama] || "").toString().trim();
+      if(!nama) continue;
+
+      const wali = (r[kWali] || "").toString().trim();
+      // Nomor WA sering terbaca sebagai angka (mis. 6.28123e+11) atau kehilangan "0"
+      // di depan. Normalkan ke format 62xxxxxxxxxx supaya tombol "Tagih" berfungsi.
+      let noWA = (r[kWA] || "").toString().trim().replace(/[\s\-().]/g, "");
+      if(/e\+/i.test(noWA)) noWA = "";                       // buang notasi ilmiah yang rusak
+      if(noWA.startsWith("+")) noWA = noWA.slice(1);
+      if(noWA.startsWith("0")) noWA = "62" + noWA.slice(1);
+      if(noWA && !/^\d{8,15}$/.test(noWA)) noWA = "";        // buang nilai yang jelas bukan nomor
+
+      MASTER_KELAS.push({ nama: nama, wali: wali || "-", noWA: noWA });
     }
   }
   
@@ -1175,13 +1215,27 @@ document.getElementById("btnLiveSync")?.addEventListener("click", () => {
 });
 
 // ================= KONEKSI DATA (mode Apps Script ATAU mode web biasa/Vercel) =================
-// ID Spreadsheet & GID sheet "aktivitas" diambil dari URL spreadsheet yang diberikan.
-const SPREADSHEET_ID = "1QsF85ApyuXCKub3UfNRgQ5PPnWlClpVLnUpm-GLqPAw";
-const GID_AKTIVITAS = "569083285";       // gid sheet "aktivitas" (data Laporan KBM)
-const SHEET_NAME_KELAS = "Master Kelas"; // nama sheet referensi kelas (opsional)
+// PENTING: sistem ini memakai DUA spreadsheet yang berbeda.
+//  1) Spreadsheet SUMBER  -> berisi sheet "aktivitas" (data mentah input guru).
+//  2) Spreadsheet KBM     -> berisi sheet "Laporan KBM", "Master Kelas", "Riwayat Arsip"
+//                            (yang dibuat oleh setupDataSheets() di Code.gs).
+// Sebelumnya semua request diarahkan ke spreadsheet SUMBER saja, sehingga permintaan
+// sheet "Master Kelas" tidak ketemu dan Google gviz diam-diam mengembalikan sheet
+// PERTAMA spreadsheet itu (berisi ID "ABS-..." + tanggal) -> itulah sebab nama kelas
+// dan wali kelas tampil ngawur. Kini masing-masing diambil dari spreadsheet yang benar.
+const SPREADSHEET_ID_SUMBER = "1QsF85ApyuXCKub3UfNRgQ5PPnWlClpVLnUpm-GLqPAw";
+const GID_AKTIVITAS = "569083285";       // gid sheet "aktivitas" di spreadsheet SUMBER
 
-function gvizUrl({ gid, sheetName }) {
-  let url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/gviz/tq?tqx=out:json&headers=1`;
+const SPREADSHEET_ID_KBM = "1X368kmfRlLxuXJZos6RRO2S8NUWlzR3ro-od7mdDXh8";
+const GID_LAPORAN_KBM = "836433322";     // gid sheet "Laporan KBM" di spreadsheet KBM
+const SHEET_NAME_KELAS = "Master Kelas"; // sheet referensi kelas -> ada di spreadsheet KBM
+
+// Dipertahankan agar kode lama yang masih memakai nama ini tidak rusak.
+const SPREADSHEET_ID = SPREADSHEET_ID_SUMBER;
+
+function gvizUrl({ gid, sheetName, spreadsheetId }) {
+  const id = spreadsheetId || SPREADSHEET_ID_SUMBER;
+  let url = `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:json&headers=1`;
   if (gid) url += `&gid=${encodeURIComponent(gid)}`;
   else if (sheetName) url += `&sheet=${encodeURIComponent(sheetName)}`;
   return url;
@@ -1213,15 +1267,41 @@ function parseGvizResponse(text) {
 // supaya logika dashboard yang sudah ada tidak perlu diubah sama sekali.
 function transformAktivitasRows(rawRows) {
   if (!rawRows || rawRows.length < 2) return rawRows || [];
-  const rawHeader = rawRows[0].map(h => (h || "").toString().trim().toLowerCase());
-  const idx = (name) => rawHeader.indexOf(name);
+  // Normalkan header: huruf kecil, spasi/underscore/tanda baca disamakan.
+  // Dengan begitu "Jam Ke", "jam_ke", "JAM KE-" semuanya cocok.
+  const norm = (s) => (s || "").toString().trim().toLowerCase().replace(/[\s._-]+/g, "");
+  const rawHeader = rawRows[0].map(norm);
+
+  // Cocokkan persis dulu, baru cocokkan sebagian — alias ditulis dari yang
+  // paling spesifik ke paling umum agar tidak salah tangkap kolom lain.
+  const idx = (...alias) => {
+    for (const a of alias) {
+      const t = norm(a);
+      const exact = rawHeader.indexOf(t);
+      if (exact !== -1) return exact;
+    }
+    for (const a of alias) {
+      const t = norm(a);
+      const partial = rawHeader.findIndex(h => h.includes(t));
+      if (partial !== -1) return partial;
+    }
+    return -1;
+  };
 
   const c = {
-    tgl: idx("tanggal"), kelas: idx("kelas"), guru: idx("guru"),
-    jamMasuk: idx("jam_masuk"), jamKeluar: idx("jam_keluar"), jamKe: idx("jam_ke"),
-    materi: idx("materi"), tugas: idx("tugas"), catatan: idx("catatan"),
-    mapel: idx("mapel"), jpKbm: idx("jumlah_jam_kbm"), jpGuru: idx("jumlah_jam_guru"),
-    pendampingan: idx("pendampingan")
+    tgl: idx("tanggal", "tgl", "date"),
+    kelas: idx("kelas", "rombel"),
+    guru: idx("namaguru", "guru", "pengajar"),
+    jamMasuk: idx("jammasuk", "masukpukul", "gurumasukpukul", "jamdatang"),
+    jamKeluar: idx("jamkeluar", "keluarpukul", "gurukeluarpukul"),
+    jamKe: idx("jamke", "jampelajaran", "jp"),
+    materi: idx("materi", "materipembelajaran"),
+    tugas: idx("tugas"),
+    catatan: idx("catatan", "keterangan", "ket"),
+    mapel: idx("matapelajaran", "mapel", "pelajaran"),
+    jpKbm: idx("jumlahjamkbm", "jamsesuaijadwal", "jpjadwal", "jumlahjam"),
+    jpGuru: idx("jumlahjamguru", "jamreal", "jpreal"),
+    pendampingan: idx("pendampingan", "pendamping")
   };
 
   const outHeader = ["TANGGAL","JAM KE","KELAS","MATA PELAJARAN","NAMA GURU",
@@ -1260,18 +1340,60 @@ function deriveKelasFromAktivitas(transformedRows) {
   return [["Nama Kelas", "Wali / Ketua Kelas", "No WA"], ...unique.map(k => [k, "-", ""])];
 }
 
+// Pengaman: pastikan sheet yang terambil BENAR-BENAR "Master Kelas".
+// gviz tidak melempar error kalau nama sheet tidak ketemu — ia mengembalikan sheet
+// pertama. Tanpa pengecekan ini, data acak (ID absensi/tanggal) akan tampil sebagai
+// nama kelas & wali kelas. Kita verifikasi headernya dulu sebelum dipakai.
+function isValidMasterKelas(rows) {
+  if (!rows || rows.length < 2 || !rows[0]) return false;
+  const h = rows[0].map(x => (x || "").toString().trim().toLowerCase());
+  const kolomPertamaBenar = h[0].includes("kelas");
+  const adaKolomWali = h.some(x => x.includes("wali") || x.includes("ketua"));
+  return kolomPertamaBenar && adaKolomWali;
+}
+
+// Buang baris yang jelas bukan data kelas (mis. ID "ABS-2026-08-03-0097251068"
+// atau sel tanggal), supaya tidak bocor ke tampilan kalau sheet berisi sisa data lain.
+function sanitizeMasterKelas(rows) {
+  const header = rows[0];
+  const bersih = rows.slice(1).filter(r => {
+    const nama = (r && r[0] ? r[0] : "").toString().trim();
+    if (!nama) return false;
+    if (/^ABS[-_]/i.test(nama)) return false;                 // pola ID absensi
+    if (/^\d{4}-\d{2}-\d{2}/.test(nama)) return false;         // pola tanggal ISO
+    if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(nama)) return false; // pola tanggal dd/mm/yyyy
+    if (nama.length > 40) return false;                        // nama kelas tidak sepanjang ini
+    return true;
+  });
+  return [header, ...bersih];
+}
+
 async function fetchSheetViaGviz() {
-  const resAktivitas = await fetch(gvizUrl({ gid: GID_AKTIVITAS }));
+  // 1) Data KBM diambil dari sheet "aktivitas" di spreadsheet SUMBER,
+  //    lalu diterjemahkan ke struktur header sheet "Laporan KBM".
+  const resAktivitas = await fetch(gvizUrl({ spreadsheetId: SPREADSHEET_ID_SUMBER, gid: GID_AKTIVITAS }));
   if (!resAktivitas.ok) throw new Error("Gagal mengambil sheet aktivitas (HTTP " + resAktivitas.status + "). Pastikan sheet dibagikan sebagai 'Siapa saja yang memiliki link'.");
   const dataLap = transformAktivitasRows(parseGvizResponse(await resAktivitas.text()));
 
+  // 2) Master Kelas (nama kelas, wali kelas, no WA) diambil dari spreadsheet KBM —
+  //    BUKAN dari spreadsheet sumber. Inilah perbaikan utama bug data wali kelas.
   let dataKelas = [];
   try {
-    const resKelas = await fetch(gvizUrl({ sheetName: SHEET_NAME_KELAS }));
-    if (resKelas.ok) dataKelas = parseGvizResponse(await resKelas.text());
+    const resKelas = await fetch(gvizUrl({ spreadsheetId: SPREADSHEET_ID_KBM, sheetName: SHEET_NAME_KELAS }));
+    if (resKelas.ok) {
+      const hasil = parseGvizResponse(await resKelas.text());
+      if (isValidMasterKelas(hasil)) {
+        dataKelas = sanitizeMasterKelas(hasil);
+      } else {
+        console.warn("Sheet yang terambil bukan 'Master Kelas' (header tidak cocok). Data diabaikan.", hasil[0]);
+      }
+    }
   } catch (e) {
     console.warn("Sheet 'Master Kelas' tidak ditemukan/diakses.", e);
   }
+
+  // 3) Fallback: kalau Master Kelas benar-benar tidak terbaca, susun daftar kelas
+  //    dari data aktivitas (wali & no WA kosong) — lebih baik kosong daripada salah.
   if (!dataKelas || dataKelas.length < 2) {
     dataKelas = deriveKelasFromAktivitas(dataLap);
   }
